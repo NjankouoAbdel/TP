@@ -1,15 +1,5 @@
 """
 Brique 3 — Le RAG qui orchestre tout.
-
-Pipeline de answer_question() :
-  1. Modération de la question (agent modérateur, Brique 2)
-  2. Si injection détectée -> refus immédiat, ON N'APPELLE JAMAIS le LLM
-     principal avec cette question. L'ORDRE est une décision de
-     sécurité : on ne veut surtout pas que le texte suspect atteigne
-     le modèle qui a accès au contexte "sensible" (même minime ici).
-  3. Sinon -> récupération des chunks (Brique 1)
-  4. Construction du prompt système à trous (remplacement de {{Chunks}})
-  5. Appel au LLM de génération avec messages system/user
 """
 
 import os
@@ -22,6 +12,7 @@ from config import (
     PROMPT_RAG_PATH,
     CHUNKS_PLACEHOLDER,
     TOP_K,
+    MIN_SIMILARITY,
 )
 from moderator import Moderator
 from vector_db import VectorDB
@@ -32,16 +23,21 @@ REFUS_INJECTION = (
     "du système (prompt injection) et n'a pas été transmise au modèle."
 )
 
+REFUS_FAIBLE_SIMILARITE = (
+    "Je n'ai trouvé aucun extrait suffisamment pertinent dans la base de "
+    "connaissances pour répondre avec confiance."
+)
+
 
 class RAG:
     def __init__(self, vector_db: VectorDB):
-        load_dotenv()  # charge GROQ_API_KEY depuis .env
+        load_dotenv()
 
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
             raise ValueError(
                 "GROQ_API_KEY absente. Copiez .env.example en .env et "
-                "renseignez votre clé (console.groq.com)."
+                "renseignez votre clé."
             )
 
         self.client = Groq(api_key=api_key)
@@ -52,8 +48,6 @@ class RAG:
             self.system_prompt_template = f.read()
 
     def _build_system_prompt(self, chunks: list[dict]) -> str:
-        # Les chunks sont déjà triés du plus au moins pertinent par
-        # ChromaDB (résultats classés par distance croissante).
         formatted = "\n".join(
             f"{i + 1}. {c['text']}" for i, c in enumerate(chunks)
         )
@@ -67,9 +61,21 @@ class RAG:
                 "answer": REFUS_INJECTION,
                 "blocked": True,
                 "chunks": [],
+                "best_similarity": None,
             }
 
         chunks = self.vector_db.retrieve(question, n=TOP_K)
+
+        best_similarity = chunks[0]["similarity"] if chunks else 0
+
+        if best_similarity < MIN_SIMILARITY:
+            return {
+                "answer": REFUS_FAIBLE_SIMILARITE,
+                "blocked": False,
+                "chunks": chunks,
+                "best_similarity": best_similarity,
+            }
+
         system_prompt = self._build_system_prompt(chunks)
 
         response = self.client.chat.completions.create(
@@ -84,4 +90,5 @@ class RAG:
             "answer": response.choices[0].message.content,
             "blocked": False,
             "chunks": chunks,
+            "best_similarity": best_similarity,
         }
